@@ -13,6 +13,7 @@
 - [模块详解](#模块详解)
   - [data_reviewer — 数据审核清洗](#data_reviewer--数据审核清洗)
   - [data_processor — 数据标准化与增强](#data_processor--数据标准化与增强)
+  - [data_merger — 数据集合并](#data_merger--数据集合并)
   - [data_launcher — GUI 统一面板](#data_launcher--gui-统一面板)
 - [数据传输规范](#数据传输规范)
   - [文件命名规范](#文件命名规范)
@@ -41,6 +42,7 @@
 |------|------|------|------|
 | 审核清洗 | `data_reviewer` | 散装 .jpg 图片 | 剔除垃圾图后的干净图片集 |
 | 标准化增强 | `data_processor` | 清洗后的图片集 | tub 格式训练集（含可选数据增强） |
+| 合并 | `data_merger` | 多个 datas 目录 | 按比例随机采样合并 | 第三个环节 |
 | GUI 面板 | `data_launcher` | — | 一键串联上述两个环节 |
 
 ---
@@ -48,12 +50,12 @@
 ## 系统架构
 
 ```
-采集原始数据              审核清洗                标准化 & 增强            模型训练
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│ datas_ot1/   │───▶│ data_reviewer│───▶│data_processor│───▶│   tub/       │
-│ *.jpg 散装    │    │ X 标记垃圾    │    │ 标准化 + 增强  │    │ 可直接训练    │
-│              │    │ 移至 trash/  │    │ 生成 record   │    │              │
-└──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
+采集原始数据              审核清洗                合并                    标准化 & 增强            模型训练
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│ datas_ot1/   │───▶│ data_reviewer│───▶│ data_merger  │───▶│data_processor│───▶│   tub/       │
+│ *.jpg 散装    │    │ X 标记垃圾    │    │ 多源按比例合并  │    │ 标准化 + 增强  │    │ 可直接训练    │
+│              │    │ 移至 trash/  │    │              │    │              │    │              │
+└──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
 ```
 
 **模块关系：**
@@ -61,10 +63,12 @@
 ```
 data_launcher.py  ── GUI 启动器 ──┐
                                   ├──▶ data_reviewer.run_reviewer()
+                                  ├──▶ data_merger.merge_datasets()
                                   ├──▶ data_processor.create_tub()
                                   └──▶ 日志面板 (LogRedirector)
 
 data_reviewer.py  ── 独立可运行（CLI），也可被 GUI 调用
+data_merger.py    ── 独立可运行（CLI），也可被 GUI 调用
 data_processor.py ── 独立可运行（CLI），也可被 GUI 调用
 ```
 
@@ -190,6 +194,36 @@ python data_processor.py user/clockwise-v1/datas --replace
 ```
 
 **输出规范：** 详见 [数据传输规范](#数据传输规范) 章节。
+
+---
+
+### data_merger — 数据集合并
+
+**功能：** 将多个清洗后的 `datas/` 目录按指定比例随机采样，合并到一个目标目录。
+
+**核心流程：**
+
+1. 接收多个 `--src PATH:RATIO` 参数和一个 `-o` 目标目录
+2. 对每个源目录：扫描所有 `.jpg`，按比例随机抽取
+3. 逐个复制到目标目录（同名文件跳过，先到先得）
+4. 输出统计摘要
+
+**运行方式：**
+
+```bash
+# 基本用法：两个源各取不同比例
+python data_merger.py --src user/clockwise_none/datas:0.6 --src user/clockwise_barrier/datas:1.0 -o user/merged/datas
+
+# 单源抽样
+python data_merger.py --src user/clockwise-v1/datas:0.5 -o user/clockwise-v1/datas_50pct
+```
+
+**注意事项：**
+
+- 比例 1.0 表示全取不随机，0.0 表示跳过该源
+- 目标目录不存在时自动创建
+- 同名文件冲突：保留先复制的那份，跳过后续同名文件并打印警告
+- 合并操作不修改原始数据源
 
 ---
 
@@ -649,6 +683,16 @@ python data_processor.py INPUT_DIR [选项]
   --replace            覆盖模式：增强替代原图，不保留原始帧
   --ratio STRING       类别均衡比例，格式 "FW:N,TL:N,TR:N"（默认: 不启用）
   --balance-mode MODE  均衡模式: downsample(降采样) 或 upsample(升采样)
+```
+
+### data_merger.py
+
+```
+python data_merger.py --src PATH:RATIO [...] -o PATH
+
+必需参数:
+  --src PATH:RATIO    源目录:采样比例（可重复多次），比例范围 0.0~1.0
+  -o, --output PATH   目标目录（不存在则自动创建）
 ```
 
 ---
