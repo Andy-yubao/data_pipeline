@@ -17,6 +17,7 @@ import glob as _glob
 
 from data_reviewer import run_reviewer
 from data_processor import create_tub
+from data_merger import merge_datasets
 
 
 class LogRedirector:
@@ -48,7 +49,7 @@ class DataLauncher:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("AutoCar 数据处理面板")
-        self.root.geometry("700x550")
+        self.root.geometry("700x750")
         self.root.minsize(580, 400)
         self.root.resizable(True, True)
 
@@ -91,6 +92,43 @@ class DataLauncher:
 
         # 数据集目录变更时自动更新 tub 输出路径
         self.input_var.trace_add('write', lambda *_: self._auto_update_output())
+
+        # ---- 数据集合并区 ----
+        merge_frame = ttk.LabelFrame(self.root, text="数据集合并", padding=10)
+        merge_frame.pack(fill=tk.X, padx=12, pady=(4, 8))
+
+        # 数据源行容器
+        self.merge_sources_container = ttk.Frame(merge_frame)
+        self.merge_sources_container.pack(fill=tk.X)
+
+        # 数据源行列表: 每项 (path_var, ratio_var, row_frame)
+        self.merge_sources = []
+        self._add_merge_source_row()
+        self._add_merge_source_row()
+
+        # 添加数据源按钮
+        add_src_btn = ttk.Button(
+            merge_frame, text="+ 添加数据源",
+            command=self._add_merge_source_row
+        )
+        add_src_btn.pack(anchor=tk.W, pady=(4, 6))
+
+        # 目标目录行
+        dest_row = ttk.Frame(merge_frame)
+        dest_row.pack(fill=tk.X, pady=2)
+        ttk.Label(dest_row, text="目标目录:", width=14).pack(side=tk.LEFT)
+        self.merge_dest_var = tk.StringVar()
+        ttk.Entry(dest_row, textvariable=self.merge_dest_var).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        ttk.Button(dest_row, text="浏览...", width=7,
+                   command=self._browse_merge_dest).pack(side=tk.RIGHT)
+
+        # 合并按钮
+        self.btn_merge = ttk.Button(
+            merge_frame, text="合并数据集", width=14,
+            command=self.on_merge
+        )
+        self.btn_merge.pack(pady=(6, 0))
 
         # ---- 增强选项 + 操作按钮 ----
         action_frame = ttk.Frame(self.root)
@@ -513,6 +551,94 @@ class DataLauncher:
     def _processing_done(self):
         self.btn_review.config(state=tk.NORMAL)
         self.btn_process.config(state=tk.NORMAL)
+        self.log("—" * 40)
+    # ---- 数据集合并 ----
+    def _add_merge_source_row(self):
+        """动态添加一行数据源输入控件"""
+        path_var = tk.StringVar()
+        ratio_var = tk.IntVar(value=100)
+
+        row = ttk.Frame(self.merge_sources_container)
+        row.pack(fill=tk.X, pady=2)
+
+        idx = len(self.merge_sources) + 1
+        ttk.Label(row, text=f"源{idx:02d}:", width=6).pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=path_var).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+
+        def browse(idx_local=idx - 1):
+            path = filedialog.askdirectory(title=f"选择源{idx_local + 1:02d}目录")
+            if path:
+                self.merge_sources[idx_local][0].set(os.path.normpath(path))
+
+        ttk.Button(row, text="浏览", width=5, command=browse).pack(side=tk.LEFT)
+        ttk.Label(row, text=" 比例").pack(side=tk.LEFT)
+        ttk.Spinbox(row, from_=1, to=100, width=3,
+                    textvariable=ratio_var).pack(side=tk.LEFT)
+        ttk.Label(row, text="%").pack(side=tk.LEFT, padx=(0, 4))
+
+        self.merge_sources.append((path_var, ratio_var, row))
+
+    def _browse_merge_dest(self):
+        """浏览选择合并目标目录"""
+        path = filedialog.askdirectory(title="选择合并目标目录（不存在将自动创建）")
+        if path:
+            self.merge_dest_var.set(os.path.normpath(path))
+
+    def on_merge(self):
+        """执行数据集合并（后台线程）"""
+        # 收集有效数据源
+        src_map = {}
+        for path_var, ratio_var, _ in self.merge_sources:
+            p = path_var.get().strip()
+            if not p:
+                continue
+            p = os.path.normpath(p)
+            ratio = ratio_var.get() / 100.0
+            src_map[p] = ratio
+
+        if not src_map:
+            messagebox.showerror("错误", "请至少填写一个数据源路径。")
+            return
+
+        dest = self.merge_dest_var.get().strip()
+        if not dest:
+            messagebox.showerror("错误", "请指定目标目录。")
+            return
+
+        # 校验源目录存在
+        missing = [p for p in src_map if not os.path.isdir(p)]
+        if missing:
+            messagebox.showerror(
+                "错误",
+                "以下源目录不存在:\n" + "\n".join(f"  - {m}" for m in missing)
+            )
+            return
+
+        self.log(f"[合并] 启动 → {len(src_map)} 个数据源 → {dest}")
+
+        self.btn_review.config(state=tk.DISABLED)
+        self.btn_process.config(state=tk.DISABLED)
+        self.btn_merge.config(state=tk.DISABLED)
+
+        def worker():
+            old_stdout = sys.stdout
+            sys.stdout = LogRedirector(self.root, self.log)
+            try:
+                merge_datasets(src_map, dest)
+            except Exception as e:
+                self.root.after(0, self.log, f"[-] 错误: {e}")
+            finally:
+                sys.stdout = old_stdout
+                self.root.after(0, self._merge_done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _merge_done(self):
+        """合并完成后恢复按钮"""
+        self.btn_review.config(state=tk.NORMAL)
+        self.btn_process.config(state=tk.NORMAL)
+        self.btn_merge.config(state=tk.NORMAL)
         self.log("—" * 40)
 
 
