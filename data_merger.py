@@ -90,16 +90,20 @@ def merge_datasets(src_map, output_dir):
                 print(f"  [~] 跳过重复: {filename} (来自 {os.path.basename(src_dir)})")
                 skipped += 1
                 continue
-            shutil.copy2(src_path, os.path.join(output_dir, filename))
-            existing_names.add(filename)
-            copied += 1
+            try:
+                shutil.copy2(src_path, os.path.join(output_dir, filename))
+                existing_names.add(filename)
+                copied += 1
+            except OSError as e:
+                print(f"  [-] 复制失败: {filename}: {e}")
+                skipped += 1
 
         # 源目录简称
         src_label = os.path.basename(src_dir)
 
         summary_lines.append(
-            f"  {src_label} → 取 {len(selected)}/{n_total} ({ratio:.0%})"
-            + (f", 跳过重复 {skipped}" if skipped > 0 else "")
+            f"  {src_label} → 取 {copied}/{n_total} ({ratio:.0%})"
+            + (f", 跳过 {skipped}" if skipped > 0 else "")
         )
         total_selected += len(selected)
         total_available += n_total
