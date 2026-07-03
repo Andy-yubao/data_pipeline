@@ -73,7 +73,9 @@ def merge_datasets(src_map, output_dir):
             continue
 
         # 采样
-        if ratio >= 1.0:
+        if ratio <= 0.0:
+            selected = []
+        elif ratio >= 1.0:
             selected = all_files
         else:
             n_select = max(1, int(n_total * ratio))
