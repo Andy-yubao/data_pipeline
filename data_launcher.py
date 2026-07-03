@@ -589,12 +589,23 @@ class DataLauncher:
         """执行数据集合并（后台线程）"""
         # 收集有效数据源
         src_map = {}
-        for path_var, ratio_var, _ in self.merge_sources:
+        seen = {}
+        for i, (path_var, ratio_var, _) in enumerate(self.merge_sources, 1):
             p = path_var.get().strip()
             if not p:
                 continue
             p = os.path.normpath(p)
-            ratio = ratio_var.get() / 100.0
+            try:
+                ratio = ratio_var.get() / 100.0
+            except tk.TclError:
+                messagebox.showerror("错误", f"源{i:02d} 的比例不是有效数字。")
+                return
+            if p in seen:
+                messagebox.showwarning(
+                    "警告",
+                    f"数据源被多次指定，将使用最后一次的比例:\n{p}"
+                )
+            seen[p] = True
             src_map[p] = ratio
 
         if not src_map:
@@ -614,6 +625,16 @@ class DataLauncher:
                 "以下源目录不存在:\n" + "\n".join(f"  - {m}" for m in missing)
             )
             return
+
+        # 目标目录非空提示
+        if os.path.isdir(dest) and _glob.glob(os.path.join(dest, '*.jpg')):
+            ok = messagebox.askyesno(
+                "目标目录非空",
+                f"目标目录已有文件:\n{dest}\n\n将继续合并（同名文件将跳过）。是否继续？"
+            )
+            if not ok:
+                self.log("[*] 合并已取消。")
+                return
 
         self.log(f"[合并] 启动 → {len(src_map)} 个数据源 → {dest}")
 
