@@ -7,6 +7,7 @@
 
 import os
 import cv2
+import numpy
 import glob
 import shutil
 import argparse
@@ -15,7 +16,6 @@ import argparse
 # 默认路径（可通过 CLI 参数覆盖）
 # ==========================================
 DEFAULT_DATA_DIR = 'E:/autonomous_driving/datas_ot1'
-DEFAULT_TRASH_DIR = 'E:/autonomous_driving/trash'
 
 
 def setup_trash(trash_dir):
@@ -25,55 +25,67 @@ def setup_trash(trash_dir):
 
 
 def draw_overlay(img, filename, current_idx, total, is_marked, goto_buffer=""):
-    """在图片上绘制UI信息（已修复字体过大超框的问题）"""
-    # 1. 提取标签
+    """在放大后的图片上绘制UI信息，并在下方添加独立信息栏
+
+    原始图像为 180×320，直接显示过小。本函数先放大到适合屏幕的尺寸，
+    再绘制指令标签和信息栏，确保所有文字清晰可读。
+    """
+    # ---- 0. 放大图像到适合显示的尺寸 ----
+    DISPLAY_W = 640  # 显示宽度
+    h_orig, w_orig = img.shape[:2]
+    scale = DISPLAY_W / w_orig
+    DISPLAY_H = int(h_orig * scale)
+    img = cv2.resize(img, (DISPLAY_W, DISPLAY_H), interpolation=cv2.INTER_NEAREST)
+    h, w = DISPLAY_H, DISPLAY_W
+
+    # ---- 1. 提取标签 ----
     try:
         command = filename.split('_')[-1].split('.')[0]
     except Exception:
         command = "UNKNOWN"
 
-    # 标签色彩逻辑
     if command == 'FW':
-        color = (0, 255, 0)       # 绿色 (护眼，代表安全直行)
+        cmd_color = (0, 255, 0)
     elif command == 'TR':
-        color = (255, 255, 0)     # 天蓝色 (保留你喜欢的舒适冷色)
+        cmd_color = (255, 255, 0)
     elif command == 'TL':
-        color = (0, 255, 255)     # 明黄色 (温暖且极具辨识度，代表左侧警示)
+        cmd_color = (0, 255, 255)
     else:
-        color = (255, 255, 255)   # 未知指令使用默认纯白色
+        cmd_color = (255, 255, 255)
 
-    # 获取图像的高(h)和宽(w)，用来动态计算文字应该放在哪里
-    h, w = img.shape[:2]
-
-    # 2. 垃圾标记警告界面
+    # ---- 2. 绘制图像区域叠层（垃圾标记 / 指令标签） ----
     if is_marked:
         overlay = img.copy()
         cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 255), -1)
         img = cv2.addWeighted(overlay, 0.3, img, 0.7, 0)
-        # 修改：字号从 1.5 降到 0.8，粗细从 4 降到 2，位置动态居中偏上
-        cv2.putText(img, "MARKED FOR TRASH", (w//2 - 120, h//2 - 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        cv2.putText(img, "MARKED FOR TRASH", (w // 2 - 220, h // 2 - 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 0, 255), 3)
     else:
-        # 正常状态：显示指令
-        # 修改：字号从 2.0 降到 1.2，粗细从 4 降到 3，确保画面清爽
-        cv2.putText(img, f"Cmd: {command}", (w//2 - 80, h//2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
+        cv2.putText(img, f"Cmd: {command}", (w // 2 - 130, h // 2 + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 2.0, cmd_color, 4)
 
-    # 3. 绘制左上角的进度条（含跳转输入）
-    # 修改：字号降为 0.55，进度与跳转同行紧凑显示
+    # ---- 3. 构建独立信息栏 ----
+    BAR_H = 56
+    bar = numpy.zeros((BAR_H, w, 3), dtype=numpy.uint8)
+    bar[:] = (35, 35, 35)
+
+    # 顶部分隔亮线
+    cv2.line(bar, (0, 0), (w, 0), (100, 100, 100), 2)
+
+    # 第一行：进度（左）+ 跳转缓冲（左）
     progress_text = f"[{current_idx + 1} / {total}]"
     if goto_buffer:
         progress_text += f"  Goto: {goto_buffer}_"
-    cv2.putText(img, progress_text, (10, 28),
+    cv2.putText(bar, progress_text, (16, 24),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 2)
+
+    # 第二行：快捷键
+    controls = "Space: Next    A: Prev    X: Trash    Num+Enter: Jump    Q: Quit"
+    cv2.putText(bar, controls, (16, 48),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
 
-    # 4. 绘制底部的操作提示
-    # 修改：精简了文案，缩短长度；字号降为 0.45，紧贴底部边缘，绝对不会超框
-    controls = "Space/D:Next  A:Prev  X:Trash  Num+Enter:Jump  Q:Quit"
-    cv2.putText(img, controls, (10, h - 15),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (230, 230, 230), 1)
-
-    return img
+    # ---- 4. 垂直拼接 ----
+    return numpy.vstack((img, bar))
 
 
 def run_reviewer(raw_data_dir, trash_dir, confirm_callback=None):
@@ -106,7 +118,7 @@ def run_reviewer(raw_data_dir, trash_dir, confirm_callback=None):
     goto_buffer = ""  # 跳转数字输入缓冲区
     # 创建一个命名窗口，允许自由缩放大小
     cv2.namedWindow('Data Reviewer', cv2.WINDOW_NORMAL)
-    cv2.resizeWindow('Data Reviewer', 800, 600)  # 默认弹窗大小
+    cv2.resizeWindow('Data Reviewer', 700, 500)  # 默认弹窗大小
 
     while idx < total_images:
         img_path = image_paths[idx]
@@ -125,8 +137,16 @@ def run_reviewer(raw_data_dir, trash_dir, confirm_callback=None):
         display_img = draw_overlay(img, filename, idx, total_images, is_marked, goto_buffer)
         cv2.imshow('Data Reviewer', display_img)
 
-        # 等待键盘输入 (0 表示无限等待，直到有按键按下)
-        key = cv2.waitKey(0) & 0xFF
+        # 等待键盘输入（100ms 超时轮询，以便检测窗口 X 按钮关闭）
+        key = cv2.waitKey(100) & 0xFF
+
+        # 检测窗口是否被用户点击 X 关闭 → 等同于按 Q 退出
+        if cv2.getWindowProperty('Data Reviewer', cv2.WND_PROP_VISIBLE) < 1:
+            break
+
+        # 无按键，继续等待
+        if key == 255:
+            continue
 
         # ---- 数字键入：累积到跳转缓冲区 ----
         if ord('0') <= key <= ord('9'):
@@ -216,7 +236,8 @@ if __name__ == '__main__':
   python data_reviewer.py
   python data_reviewer.py E:/autonomous_driving/datas_ot1
   python data_reviewer.py E:/autonomous_driving/datas_ot1 -t E:/autonomous_driving/trash
-  python data_reviewer.py user/clockwise-v1/datas -t user/clockwise-v1/trash
+  python data_reviewer.py user/clockwise-v1/datas
+  python data_reviewer.py user/clockwise-v1/datas -t user/custom_trash
         """
     )
 
@@ -225,9 +246,16 @@ if __name__ == '__main__':
         help=f'原始图片所在目录 (默认: {DEFAULT_DATA_DIR})'
     )
     parser.add_argument(
-        '--trash', '-t', default=DEFAULT_TRASH_DIR,
-        help=f'垃圾箱目录 (默认: {DEFAULT_TRASH_DIR})'
+        '--trash', '-t', default=None,
+        help='垃圾箱目录 (默认: 数据集同级目录下的 trash/)'
     )
 
     args = parser.parse_args()
-    run_reviewer(args.input_dir, args.trash)
+
+    # 自动计算默认垃圾箱路径：与数据集同级的 trash/ 目录
+    trash_dir = args.trash
+    if trash_dir is None:
+        input_abs = os.path.abspath(args.input_dir)
+        trash_dir = os.path.join(os.path.dirname(input_abs), 'trash')
+
+    run_reviewer(args.input_dir, trash_dir)
