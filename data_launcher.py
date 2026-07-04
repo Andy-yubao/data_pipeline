@@ -614,16 +614,23 @@ class AugmentPage(tk.Toplevel, _LogMixin):
             messagebox.showerror("错误", "无法确定 Tub 输出目录。")
             return
 
+        # 安全检查：防止输出路径误删源数据
+        try:
+            from data_processor import _validate_output_path
+            _validate_output_path(input_dir, output_dir)
+        except ValueError as e:
+            messagebox.showerror("路径错误", str(e))
+            return
+
         # 输出目录覆盖确认
         if os.path.exists(output_dir):
             ok = messagebox.askyesno(
                 "确认覆盖",
-                f"输出目录已存在:\n{output_dir}\n\n是否删除并重新生成？"
+                f"输出目录已存在:\n{output_dir}\n\n是否重新生成？"
             )
             if not ok:
                 self.log("[*] 操作已取消。")
                 return
-            shutil.rmtree(output_dir)
 
         aug_config = {
             'brightness_contrast': {
@@ -673,7 +680,8 @@ class AugmentPage(tk.Toplevel, _LogMixin):
                 create_tub(input_dir, output_dir, aug_config,
                            replace_original=replace_original,
                            balance_ratio=balance_ratio,
-                           balance_mode=balance_mode)
+                           balance_mode=balance_mode,
+                           force=True)
             except Exception as e:
                 self.after(0, self.log, f"[-] 错误: {e}")
             finally:

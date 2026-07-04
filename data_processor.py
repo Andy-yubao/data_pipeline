@@ -15,6 +15,7 @@ import shutil
 import random
 import argparse
 import itertools
+from pathlib import Path
 
 # ==========================================
 # 基础配置
@@ -57,6 +58,36 @@ DEFAULT_AUG_CONFIG = {
 
 # 默认均衡配置
 DEFAULT_BALANCE_MODE = "downsample"  # downsample | upsample
+
+
+# ==========================================
+# 安全输出路径校验
+# ==========================================
+
+def _validate_output_path(input_dir, output_dir):
+    """防止输出目录等于或包含输入目录，避免误删源数据
+
+    Raises:
+        ValueError: 路径不安全时抛出
+    """
+    src = Path(input_dir).resolve()
+    dst = Path(output_dir).resolve()
+
+    if dst == src:
+        raise ValueError("输出目录不能与输入目录相同")
+
+    if str(src).startswith(str(dst) + os.sep) or src == dst:
+        raise ValueError("输出目录不能是输入目录的父目录（删除时会连带删除输入）")
+
+
+# ==========================================
+# 安全的图片写入封装
+# ==========================================
+
+def _safe_imwrite(path, image):
+    """写入图片并校验返回值，失败时抛出 OSError"""
+    if not cv2.imwrite(path, image):
+        raise OSError(f"图片写入失败: {path}")
 
 
 # ==========================================
@@ -117,9 +148,13 @@ def _balance_classes(image_paths, ratio, mode="downsample"):
         mode:        "downsample" | "upsample"
 
     Returns:
-        (selected_paths, class_multipliers)
-          - selected_paths:   均衡后的图片路径列表（已排序）
-          - class_multipliers: upsample 模式下各类增强倍率 dict，downsample 返回 None
+        (selected_paths, class_targets)
+          - selected_paths: 均衡后的图片路径列表（已排序）
+          - class_targets:  dict，upsample 模式下各类目标总量（用于生成增强变体），
+                            downsample 模式返回 None
+
+    Raises:
+        ValueError: 目标比例中某类别 ratio > 0 但实际样本数为 0
     """
     # ---- 按指令分类 ----
     buckets = {'FW': [], 'TL': [], 'TR': []}
@@ -135,15 +170,23 @@ def _balance_classes(image_paths, ratio, mode="downsample"):
 
     print(f"[均衡] 原始分布: FW={counts['FW']}, TL={counts['TL']}, TR={counts['TR']}")
 
+    # ---- 安全检查：目标比例中有但实际样本为 0 的类别 ----
+    missing = [
+        c for c, wanted in ratio.items()
+        if wanted > 0 and counts.get(c, 0) == 0
+    ]
+    if missing:
+        raise ValueError(
+            f"无法进行类别均衡，以下类别没有任何样本: {', '.join(missing)}"
+        )
+
     # ---- 计算目标数量 ----
     if mode == "downsample":
-        # 以最紧缺类别为基准，按比例收缩
         ratios_list = [counts[c] / ratio.get(c, 1) for c in buckets if ratio.get(c, 1) > 0]
         if not ratios_list:
             return image_paths, None
         base = min(ratios_list)
     elif mode == "upsample":
-        # 以最充裕类别为基准，按比例扩张
         ratios_list = [counts[c] / ratio.get(c, 1) for c in buckets if ratio.get(c, 1) > 0]
         if not ratios_list:
             return image_paths, None
@@ -175,22 +218,14 @@ def _balance_classes(image_paths, ratio, mode="downsample"):
         return selected, None
 
     elif mode == "upsample":
-        # 全部保留，计算各类需要的增强倍率
-        multipliers = {}
-        for c in buckets:
-            if counts[c] > 0 and targets[c] > counts[c]:
-                # 需要每个原始帧平均生成多少额外变体
-                # 倍率 = 需要新增的数量 / 原数量
-                multipliers[c] = (targets[c] - counts[c]) / counts[c]
-            else:
-                multipliers[c] = 0.0
-
+        # 返回各类目标量，由 create_tub 据此生成确定性数量的增强变体
         image_paths.sort()
-        print(f"[均衡] upsample 模式: 全部 {total} 帧保留，增强倍率 "
-              f"FW={multipliers['FW']:.2f}, "
-              f"TL={multipliers['TL']:.2f}, "
-              f"TR={multipliers['TR']:.2f}")
-        return image_paths, multipliers
+        net_new = sum(max(0, targets[c] - counts[c]) for c in buckets)
+        print(f"[均衡] upsample 模式: 全部 {total} 帧保留，需额外生成 {net_new} 张增强变体 "
+              f"(FW={max(0, targets['FW'] - counts['FW'])}, "
+              f"TL={max(0, targets['TL'] - counts['TL'])}, "
+              f"TR={max(0, targets['TR'] - counts['TR'])})")
+        return image_paths, targets
 
 
 # ==========================================
@@ -295,7 +330,8 @@ def _normalize_aug_config(augmentations):
 
 def create_tub(input_dir, output_dir=None, augmentations=None,
                replace_original=False,
-               balance_ratio=None, balance_mode=None):
+               balance_ratio=None, balance_mode=None,
+               force=False):
     """将原始图片文件夹标准化为 tub 格式数据集，可选数据增强和类别均衡
 
     Args:
@@ -309,6 +345,7 @@ def create_tub(input_dir, output_dir=None, augmentations=None,
                           False=原图始终保留，增强为额外记录
         balance_ratio:    None 不启用均衡；或 dict 如 {"FW": 2, "TL": 2, "TR": 1}
         balance_mode:     "downsample"（默认）或 "upsample"
+        force:            True=跳过输出目录覆盖确认（GUI 已确认时使用）
 
     Returns:
         str: tub 输出目录路径，失败时返回 None
@@ -328,6 +365,9 @@ def create_tub(input_dir, output_dir=None, augmentations=None,
 
     output_dir = os.path.normpath(output_dir)
 
+    # ---- 安全检查：防止输出路径误删源数据 ----
+    _validate_output_path(input_dir, output_dir)
+
     aug_cfg = _normalize_aug_config(augmentations)
 
     # ---- 扫描图片 ----
@@ -340,16 +380,19 @@ def create_tub(input_dir, output_dir=None, augmentations=None,
 
     print(f"[*] 扫描到 {total_files} 张图片")
 
-    # ---- 创建输出目录 ----
-    if os.path.exists(output_dir):
+    # ---- 覆盖确认 ----
+    if os.path.exists(output_dir) and not force:
         print(f"[!] 输出目录已存在: '{output_dir}'")
         confirm = input("    是否覆盖？(y/n): ")
         if confirm.lower() != 'y':
             print("[*] 操作已取消。")
             return None
-        shutil.rmtree(output_dir)
 
-    os.makedirs(output_dir)
+    # ---- 创建临时构建目录（原子替换：building → 重命名旧目录 → 最终命名） ----
+    building_dir = output_dir + ".building"
+    if os.path.exists(building_dir):
+        shutil.rmtree(building_dir)
+    os.makedirs(building_dir)
     print(f"[*] 输出目录: '{output_dir}'")
 
     # ---- 显示增强配置 ----
@@ -365,20 +408,34 @@ def create_tub(input_dir, output_dir=None, augmentations=None,
         print(f"[*] 模式: 保留原图（增强为额外记录）")
 
     # ---- 类别均衡 ----
-    class_multipliers = None
+    class_targets = None  # upsample: {cmd: target_count}; downsample: None
     if balance_ratio is not None:
         _mode = balance_mode or DEFAULT_BALANCE_MODE
         print(f"[均衡] 目标比例 FW:{balance_ratio.get('FW',1)}:"
               f"TL:{balance_ratio.get('TL',1)}:TR:{balance_ratio.get('TR',1)}, "
               f"模式={_mode}")
-        balanced_paths, class_multipliers = _balance_classes(
-            image_paths, balance_ratio, _mode
-        )
+        try:
+            balanced_paths, class_targets = _balance_classes(
+                image_paths, balance_ratio, _mode
+            )
+        except ValueError as e:
+            print(f"[-] 均衡失败: {e}")
+            shutil.rmtree(building_dir)
+            return None
         if balanced_paths is not None:
             image_paths = balanced_paths
             total_files = len(image_paths)
 
-    # ---- 逐帧处理 ----
+    # ---- 收集各类源帧池（upsample 第二阶段用） ----
+    class_source_pool = None
+    if class_targets is not None:
+        class_source_pool = {'FW': [], 'TL': [], 'TR': []}
+        for p in image_paths:
+            _, cmd = parse_filename(os.path.basename(p))
+            if cmd in class_source_pool:
+                class_source_pool[cmd].append(p)
+
+    # ---- 逐帧处理：Phase 1 — 原始帧 + 概率增强 ----
     records = []
     record_count = 0
     skipped = 0
@@ -410,45 +467,34 @@ def create_tub(input_dir, output_dir=None, augmentations=None,
         has_bc = False
         has_blur = False
 
-        # 计算有效增强概率（upsample 模式下不足类别放大）
-        _bc_prob = bc_cfg['probability']
-        _blur_prob = blur_cfg['probability']
-        if class_multipliers and command in class_multipliers:
-            mult = class_multipliers[command]
-            if mult > 0:
-                _bc_prob = min(bc_cfg['probability'] * (1 + mult), 1.0)
-                _blur_prob = min(blur_cfg['probability'] * (1 + mult), 1.0)
-
-        # 独立判定两种增强是否触发
-        if bc_cfg['enabled'] and random.random() < _bc_prob:
+        # 独立判定两种增强是否触发（概率不变，由平衡阶段确保总量）
+        if bc_cfg['enabled'] and random.random() < bc_cfg['probability']:
             has_bc = True
-        if blur_cfg['enabled'] and random.random() < _blur_prob:
+        if blur_cfg['enabled'] and random.random() < blur_cfg['probability']:
             has_blur = True
 
         if replace_original:
             # 覆盖模式：增强图片替代原图，使用原文件名
             if has_blur and has_bc:
-                # 两种增强叠加：先模糊再亮度
                 aug_img = apply_gaussian_blur(img, kernels=blur_cfg['kernels'])
                 aug_img = apply_brightness_contrast(
                     aug_img,
                     alpha_range=bc_cfg['alpha'],
                     beta_range=bc_cfg['beta']
                 )
-                cv2.imwrite(os.path.join(output_dir, filename), aug_img)
+                _safe_imwrite(os.path.join(building_dir, filename), aug_img)
             elif has_blur:
                 aug_img = apply_gaussian_blur(img, kernels=blur_cfg['kernels'])
-                cv2.imwrite(os.path.join(output_dir, filename), aug_img)
+                _safe_imwrite(os.path.join(building_dir, filename), aug_img)
             elif has_bc:
                 aug_img = apply_brightness_contrast(
                     img,
                     alpha_range=bc_cfg['alpha'],
                     beta_range=bc_cfg['beta']
                 )
-                cv2.imwrite(os.path.join(output_dir, filename), aug_img)
+                _safe_imwrite(os.path.join(building_dir, filename), aug_img)
             else:
-                # 都未触发，保留原图
-                cv2.imwrite(os.path.join(output_dir, filename), img)
+                _safe_imwrite(os.path.join(building_dir, filename), img)
             record_count += 1
             records.append({
                 "cam/image_array": filename,
@@ -458,7 +504,7 @@ def create_tub(input_dir, output_dir=None, augmentations=None,
             })
         else:
             # 非覆盖模式：原图始终保留，增强为额外记录
-            cv2.imwrite(os.path.join(output_dir, filename), img)
+            _safe_imwrite(os.path.join(building_dir, filename), img)
             record_count += 1
             records.append({
                 "cam/image_array": filename,
@@ -470,7 +516,7 @@ def create_tub(input_dir, output_dir=None, augmentations=None,
             if has_blur:
                 aug_img = apply_gaussian_blur(img, kernels=blur_cfg['kernels'])
                 aug_filename = f"{base_no_ext}_aug{aug_counter}.jpg"
-                cv2.imwrite(os.path.join(output_dir, aug_filename), aug_img)
+                _safe_imwrite(os.path.join(building_dir, aug_filename), aug_img)
                 record_count += 1
                 records.append({
                     "cam/image_array": aug_filename,
@@ -487,7 +533,7 @@ def create_tub(input_dir, output_dir=None, augmentations=None,
                     beta_range=bc_cfg['beta']
                 )
                 aug_filename = f"{base_no_ext}_aug{aug_counter}.jpg"
-                cv2.imwrite(os.path.join(output_dir, aug_filename), aug_img)
+                _safe_imwrite(os.path.join(building_dir, aug_filename), aug_img)
                 record_count += 1
                 records.append({
                     "cam/image_array": aug_filename,
@@ -501,8 +547,74 @@ def create_tub(input_dir, output_dir=None, augmentations=None,
         if (idx + 1) % 50 == 0 or idx == total_files - 1:
             print(f"  处理进度: {idx + 1}/{total_files}")
 
-    # ---- 写入 record 文件 ----
-    original_frames = total_files - skipped
+    # ---- Phase 2：upsample 补齐缺口 ----
+    if class_targets is not None:
+        original_counts = {c: len(class_source_pool[c]) for c in class_source_pool}
+        needed = {c: max(0, class_targets[c] - original_counts[c])
+                  for c in class_targets}
+        total_needed = sum(needed.values())
+
+        if total_needed > 0:
+            print(f"[upsample] 开始生成 {total_needed} 张增强变体以补齐目标比例...")
+            # 构建全局索引，保证文件名唯一
+            global_aug_idx = 0
+            rng = random.Random()
+
+            for command in ('FW', 'TL', 'TR'):
+                n = needed[command]
+                if n <= 0 or not class_source_pool[command]:
+                    continue
+
+                sources = class_source_pool[command]
+                for i in range(n):
+                    src_path = rng.choice(sources)
+                    src_img = cv2.imread(src_path)
+                    if src_img is None:
+                        continue
+                    src_img = cv2.resize(src_img, (320, 180))
+
+                    # 从源文件名派生增强文件名
+                    src_stem = os.path.splitext(os.path.basename(src_path))[0]
+                    aug_filename = f"{src_stem}_balance_{global_aug_idx:06d}.jpg"
+                    global_aug_idx += 1
+
+                    # 随机选择增强方式
+                    aug_choices = []
+                    if bc_cfg['enabled']:
+                        aug_choices.append('bc')
+                    if blur_cfg['enabled']:
+                        aug_choices.append('blur')
+
+                    if aug_choices:
+                        choice = rng.choice(aug_choices)
+                        if choice == 'bc':
+                            src_img = apply_brightness_contrast(
+                                src_img,
+                                alpha_range=bc_cfg['alpha'],
+                                beta_range=bc_cfg['beta']
+                            )
+                        elif choice == 'blur':
+                            src_img = apply_gaussian_blur(
+                                src_img, kernels=blur_cfg['kernels'])
+                    # 如果两种增强都被禁用，直接使用原图（仅缩放）
+
+                    _safe_imwrite(os.path.join(building_dir, aug_filename), src_img)
+                    record_count += 1
+                    angle, throttle = command_to_values(command)
+                    records.append({
+                        "cam/image_array": aug_filename,
+                        "user/angle": angle,
+                        "user/throttle": throttle,
+                        "user/mode": "user"
+                    })
+
+                    if (i + 1) % 50 == 0:
+                        print(f"  [upsample] {command}: {i + 1}/{n}")
+
+            print(f"[upsample] 完成，实际生成 {global_aug_idx} 张变体")
+
+    # ---- 写入 record 文件（写入构建目录） ----
+    original_frames = (total_files - skipped)
     aug_frames = len(records) - original_frames
     if replace_original:
         print(f"[*] 记录总数: {len(records)} (覆盖模式)")
@@ -511,15 +623,26 @@ def create_tub(input_dir, output_dir=None, augmentations=None,
     print(f"[*] 写入 record 文件...")
 
     for i, record in enumerate(records, start=1):
-        record_path = os.path.join(output_dir, f"record_{i}.json")
+        record_path = os.path.join(building_dir, f"record_{i}.json")
         with open(record_path, 'w', encoding='utf-8') as f:
             json.dump(record, f, ensure_ascii=False)
 
     # ---- 写入 meta.json ----
     print(f"[*] 写入 meta.json...")
-    meta_path = os.path.join(output_dir, 'meta.json')
+    meta_path = os.path.join(building_dir, 'meta.json')
     with open(meta_path, 'w', encoding='utf-8') as f:
         json.dump(META_TEMPLATE, f, indent=2, ensure_ascii=False)
+
+    # ---- 原子替换：旧输出 → .bak，构建目录 → 正式目录 ----
+    backup_dir = output_dir + ".bak"
+    if os.path.exists(backup_dir):
+        shutil.rmtree(backup_dir)
+    if os.path.exists(output_dir):
+        os.rename(output_dir, backup_dir)
+    os.rename(building_dir, output_dir)
+    if os.path.exists(backup_dir):
+        shutil.rmtree(backup_dir)
+        print(f"[*] 已清理旧输出备份")
 
     # ---- 结算 ----
     print("\n" + "=" * 50)

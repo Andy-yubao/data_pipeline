@@ -64,25 +64,27 @@ def draw_overlay(img, filename, current_idx, total, is_marked, goto_buffer=""):
         cv2.putText(img, f"Cmd: {command}", (w // 2 - 130, h // 2 + 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 2.0, cmd_color, 4)
 
-    # ---- 3. 构建独立信息栏 ----
-    BAR_H = 56
-    bar = numpy.zeros((BAR_H, w, 3), dtype=numpy.uint8)
-    bar[:] = (35, 35, 35)
+    # ---- 3. 构建独立信息栏（三行布局，防止文字溢出） ----
+    BAR_H = 82
+    bar = numpy.full((BAR_H, w, 3), 32, dtype=numpy.uint8)
 
     # 顶部分隔亮线
     cv2.line(bar, (0, 0), (w, 0), (100, 100, 100), 2)
 
-    # 第一行：进度（左）+ 跳转缓冲（左）
+    # 第一行：进度 + 跳转缓冲
     progress_text = f"[{current_idx + 1} / {total}]"
     if goto_buffer:
         progress_text += f"  Goto: {goto_buffer}_"
-    cv2.putText(bar, progress_text, (16, 24),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 2)
+    cv2.putText(bar, progress_text, (16, 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
 
-    # 第二行：快捷键
-    controls = "Space: Next    A: Prev    X: Trash    Num+Enter: Jump    Q: Quit"
-    cv2.putText(bar, controls, (16, 48),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+    # 第二行：常用审核操作
+    cv2.putText(bar, "Space / D: Next    A: Prev    X: Trash",
+                (16, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (230, 230, 230), 1, cv2.LINE_AA)
+
+    # 第三行：跳转和退出
+    cv2.putText(bar, "0-9 + Enter: Jump    Q / Esc: Quit",
+                (16, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (230, 230, 230), 1, cv2.LINE_AA)
 
     # ---- 4. 垂直拼接 ----
     return numpy.vstack((img, bar))
