@@ -341,10 +341,11 @@ class ReviewPage(tk.Toplevel, _LogMixin):
                 f"是否将它们移动到垃圾箱？\n{trash}"
             )
 
-        # 隐藏本窗口，交由 OpenCV 接管
+        # 隐藏本窗口，交由审核窗口接管
         self.withdraw()
         try:
-            run_reviewer(input_dir, trash_dir, confirm_callback=gui_confirm)
+            run_reviewer(input_dir, trash_dir,
+                         confirm_callback=gui_confirm, master=self)
         finally:
             try:
                 self.deiconify()

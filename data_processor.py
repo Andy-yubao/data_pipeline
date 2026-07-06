@@ -1,14 +1,13 @@
 #!/usr/bin/env python
 # ==============================================================================
 # 环境声明: Python 3.12
-# 核心依赖: pip install opencv-python
+# 核心依赖: pip install Pillow
 # 脚本身份: 自动驾驶数据标准化与增强工具 (Data Processor)
 # 核心逻辑: 读取清洗后的散装图片 → 解析文件名 → 生成 tub 格式 → 可选数据增强
 # 位置: data_reviewer.py 的下游环节，在推理模型训练之前运行
 # ==============================================================================
 
 import os
-import cv2
 import glob
 import json
 import shutil
@@ -16,6 +15,8 @@ import random
 import argparse
 import itertools
 from pathlib import Path
+
+from PIL import Image, ImageEnhance, ImageFilter
 
 # ==========================================
 # 基础配置
@@ -31,7 +32,7 @@ COMMAND_MAP = {
 }
 
 # 目标分辨率，与 config.py CAMERA_RESOLUTION 保持一致
-TARGET_RESOLUTION = (180, 320)  # (height, width)，cv2.resize 用 (320, 180)
+TARGET_RESOLUTION = (180, 320)  # (height, width)，PIL.resize 用 (320, 180)
 
 # tub 元数据模板，与推理模型输入格式保持一致
 META_TEMPLATE = {
@@ -85,9 +86,11 @@ def _validate_output_path(input_dir, output_dir):
 # ==========================================
 
 def _safe_imwrite(path, image):
-    """写入图片并校验返回值，失败时抛出 OSError"""
-    if not cv2.imwrite(path, image):
-        raise OSError(f"图片写入失败: {path}")
+    """写入图片并校验，失败时抛出 OSError"""
+    try:
+        image.save(path, format='JPEG')
+    except Exception as e:
+        raise OSError(f"图片写入失败: {path}") from e
 
 
 # ==========================================
@@ -235,14 +238,16 @@ def _balance_classes(image_paths, ratio, mode="downsample"):
 def parse_filename(filename):
     """从文件名中提取时间戳和驾驶指令
 
+    仅处理 FV 前缀的前置视图图片。
     期望格式: FV_<timestamp>_<COMMAND>.jpg
     示例: FV_1779764393153_FW.jpg → ('1779764393153', 'FW')
-    返回: (timestamp, command) 或 (None, None) 如果格式不匹配
+    返回: (timestamp, command) 或 (None, None) 如果格式不匹配或非 FV 图片
     """
     base = os.path.splitext(filename)[0]
     parts = base.split('_')
 
-    if len(parts) < 3:
+    # 必须以 FV_ 开头（排除 GV 顶视图图片）
+    if len(parts) < 3 or parts[0] != 'FV':
         return None, None
 
     timestamp = parts[1]
@@ -266,29 +271,31 @@ def command_to_values(command):
 # ==========================================
 
 def apply_brightness_contrast(img, alpha_range=(0.7, 1.3), beta_range=(-30, 30)):
-    """随机调整亮度和对比度
+    """随机调整亮度和对比度（PIL ImageEnhance 实现）
 
     Args:
-        img:         输入图像
+        img:         PIL Image 对象
         alpha_range: 对比度系数范围 (min, max)
         beta_range:  亮度偏移范围 (min, max)
     """
     alpha = random.uniform(*alpha_range)
     beta = random.randint(*beta_range)
-    return cv2.convertScaleAbs(img, alpha=alpha, beta=beta)
+    img = ImageEnhance.Contrast(img).enhance(alpha)
+    img = ImageEnhance.Brightness(img).enhance(1.0 + beta / 128.0)
+    return img
 
 
 def apply_gaussian_blur(img, kernels=None):
-    """随机高斯模糊
+    """随机高斯模糊（PIL ImageFilter 实现）
 
     Args:
-        img:     输入图像
+        img:     PIL Image 对象
         kernels: 可选核大小列表，默认 [3, 5]
     """
     if kernels is None:
         kernels = [3, 5]
     k = random.choice(kernels)
-    return cv2.GaussianBlur(img, (k, k), 0)
+    return img.filter(ImageFilter.GaussianBlur(radius=k // 2))
 
 
 # ==========================================
@@ -371,14 +378,20 @@ def create_tub(input_dir, output_dir=None, augmentations=None,
     aug_cfg = _normalize_aug_config(augmentations)
 
     # ---- 扫描图片 ----
-    image_paths = sorted(glob.glob(os.path.join(input_dir, '*.jpg')))
+    all_image_paths = sorted(glob.glob(os.path.join(input_dir, '*.jpg')))
+    total_jpg = len(all_image_paths)
+
+    # 过滤：只保留 FV 前置视图，跳过 GV 顶视图
+    image_paths = [p for p in all_image_paths
+                   if os.path.basename(p).startswith('FV_')]
+    gv_count = total_jpg - len(image_paths)
     total_files = len(image_paths)
 
     if total_files == 0:
-        print(f"[-] 在 '{input_dir}' 中没有找到 .jpg 图片。")
+        print(f"[-] 在 '{input_dir}' 中没有找到 FV_ 图片（共 {total_jpg} 个 .jpg 文件）。")
         return None
 
-    print(f"[*] 扫描到 {total_files} 张图片")
+    print(f"[*] 扫描到 {total_jpg} 个 .jpg 文件（FV={total_files}, GV={gv_count}）")
 
     # ---- 覆盖确认 ----
     if os.path.exists(output_dir) and not force:
@@ -451,15 +464,21 @@ def create_tub(input_dir, output_dir=None, augmentations=None,
 
         angle, throttle = command_to_values(command)
 
-        # 读取图像以验证有效性，同时留着做增强
-        img = cv2.imread(img_path)
-        if img is None:
+        # 读取图像（PIL）并验证有效性
+        try:
+            img = Image.open(img_path)
+            img.load()  # 强制加载，捕获损坏文件
+        except Exception:
             print(f"  [~] 跳过 (无法读取图像): {filename}")
             skipped += 1
             continue
 
+        # 确保 RGB 模式（PIL 可能以 P 或 RGBA 模式打开）
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+
         # 统一缩放到目标分辨率 (180×320)，与 config.py CAMERA_RESOLUTION 一致
-        img = cv2.resize(img, (320, 180))
+        img = img.resize((320, 180), Image.LANCZOS)
 
         # ---- 原始帧 + 概率增强 ----
         base_no_ext = os.path.splitext(filename)[0]
@@ -568,10 +587,14 @@ def create_tub(input_dir, output_dir=None, augmentations=None,
                 sources = class_source_pool[command]
                 for i in range(n):
                     src_path = rng.choice(sources)
-                    src_img = cv2.imread(src_path)
-                    if src_img is None:
+                    try:
+                        src_img = Image.open(src_path)
+                        src_img.load()
+                    except Exception:
                         continue
-                    src_img = cv2.resize(src_img, (320, 180))
+                    if src_img.mode != 'RGB':
+                        src_img = src_img.convert('RGB')
+                    src_img = src_img.resize((320, 180), Image.LANCZOS)
 
                     # 从源文件名派生增强文件名
                     src_stem = os.path.splitext(os.path.basename(src_path))[0]
